@@ -1,0 +1,3 @@
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+help(ChatGoogleGenerativeAI)
