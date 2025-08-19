@@ -1,19 +1,28 @@
-from pytubefix import YouTube
-from groq import Groq
-import os
 from dotenv import load_dotenv
+from pytubefix import YouTube
+from pydub import AudioSegment
+from groq import Groq
+import streamlit as st
 import re
+import os
 
-def create_folders(path_audio:str,path_summary_videos:str):
-    os.makedirs(path_audio,exist_ok=True)
-    os.makedirs(path_summary_videos,exist_ok=True)
+def create_folders(audio_dir:str,summary_dir:str):
+    """
+    Cria as pastas necessárias se não estiver criada.
+    Args:
+        audio_dir (str): Diretório dos arquivos de áudio
+        summary_dir (str): Diretório dos arquivos do vídeo
+    """
+    os.makedirs(audio_dir,exist_ok=True)
+    os.makedirs(f'{audio_dir}/temp',exist_ok=True)
+    os.makedirs(summary_dir,exist_ok=True)
 
-def download_youtube_audio(url:str,path_audio:str,filename:str='audio') -> str:
+def download_youtube_audio(url:str,audio_dir:str,filename:str = 'audio') -> str:
     """
     Baixa os áudios dos videos do Youtube com a URL informada.
     Args:
         url (str): Link do video do Youtube
-        path_audio (str): Local para baixar os arquivos de áudio
+        audio_dir (str): Local para baixar os arquivos de áudio
         filename (str): Nome do arquivo de áudio
     Returns:
         str: Nome do arquivo de áudio
@@ -27,39 +36,67 @@ def download_youtube_audio(url:str,path_audio:str,filename:str='audio') -> str:
         stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
         if not stream:
             raise ValueError('Nenhum áudio do stream foi encontrado')
-        stream.download(path_audio,filename=f'{filename}.mp3')
+        stream.download(audio_dir,filename=f'{filename}.mp3')
         return filename
     except Exception as err:
         raise Exception(f'Erro ao baixar video: {err}')
 
-def transcribe_audio(path_audio:str, groq_client:Groq, model_transcription:str = "whisper-large-v3-turbo", language:str = 'pt') -> str:
+
+def create_audio_chunk(audio_file_path:str,chunk_size:int,temp_dir:str):
+    file_name = os.path.splitext(os.path.basename(audio_file_path))[0]
+    audio = AudioSegment.from_file(audio_file_path)
+
+    start = 0
+    end = chunk_size
+    counter = 0
+    chunk_files = []
+
+    while start < len(audio):
+        chunk = audio[start:end]
+        chunk_file_path = os.path.join(temp_dir,f'{counter}_{file_name}.mp3')
+        chunk.export(chunk_file_path,format='mp3')
+        chunk_files.append(chunk_file_path)
+
+        start += chunk_size
+        end += chunk_size
+        counter += 1
+
+    return chunk_files
+
+
+def transcribe_audio(audio_dir:str, groq_client:Groq, model_transcription:str = "whisper-large-v3-turbo", language:str = 'pt') -> str:
     """
-    Pega o áudio mp3 de `path_audio` e transcreve ele.
+    Pega o áudio mp3 de `audio_dir` e transcreve ele.
     
     Args:
-        path_audio (str): Local do arquivo de áudio
+        audio_dir (str): Local do arquivo de áudio
         groq_client (Groq): Cliente do Groq
         model_transcription (str): Nome do modelo de transcrição de áudio
-        language (str): Transcreve para (pt) 'Português'
+        language (str): Transcreve para `language`
     Returns:
         str: Transcrição do áudio
 
     """
     print('Transcrevendo audio...')
-    print(path_audio)
-    with open(path_audio,'rb') as file:
-        transcription = groq_client.audio.transcriptions.create(
-            file=(path_audio, file.read()),
-            model=model_transcription,
-            language=language,
-            response_format="verbose_json",
-        )
-    os.remove(path_audio)
-    return transcription.text
+    transcription = ''
+    chunks_files = create_audio_chunk(audio_dir,2*60*1000,'videos_audios/temp')
+    for chunk in chunks_files:
+        with open(chunk,'rb') as file:
+            transcription_llm = groq_client.audio.transcriptions.create(
+                file=(chunk, file.read()),
+                model=model_transcription,
+                language=language,
+                response_format="verbose_json",
+            )
+            transcription += f' {transcription_llm.text}'
+        os.remove(chunk)
+    os.remove(audio_dir)
+    return transcription
+
 
 def create_summary(transcription:str,groq_client:Groq,summary_filename:str,model_llm:str = 'qwen/qwen3-32b',language_markdown:str = 'Portugues-BR',out_dir:str = 'summary_videos'):
     """
-    Cria um summario com a transcrição do áudio.
+    Cria um resumo em Markdown e salva na pasta específicada.
     Args:
         transcription (str): 
         groq_client (Groq): 
@@ -100,10 +137,12 @@ def create_summary(transcription:str,groq_client:Groq,summary_filename:str,model
     with open(f'{out_dir}/{summary_filename}.md','w',encoding='utf-8') as markdown:
         text_markdown = re.sub(r'<think>.*?</think>','',summary_response, flags=re.DOTALL)
         markdown.write(f'''{text_markdown}''')
+    
     print('Tudo Pronto!')
+    st.rerun()
 
-def main(url:str, markdown_filename:str, path_audio:str = 'videos_audios', path_summary_videos:str = 'summary_videos') -> None:
-    create_folders(path_audio,path_summary_videos)
+def main(audio_dir:str = 'videos_audios', summary_dir:str = 'summary_videos') -> None:
+    create_folders(audio_dir,summary_dir)
 
     loaded_env = load_dotenv()
     if not loaded_env:
@@ -111,13 +150,49 @@ def main(url:str, markdown_filename:str, path_audio:str = 'videos_audios', path_
     
     client = Groq()
 
-    audio_file_name = download_youtube_audio(url,path_audio)
-    audio_file = f'{path_audio}/{audio_file_name}.mp3'
+    if 'markdown_content' not in st.session_state:
+        st.session_state.markdown_content = {}
 
-    transcription_data = transcribe_audio(audio_file,client)
-    create_summary(transcription_data,client,summary_filename=markdown_filename)
 
-if __name__ == '__main__':
-    url = input('URL do video: ')
-    summary_filename = input('Nome do Arquivo: ')
-    main(url,summary_filename)
+    st.title('Criador de sumário de vídeo')
+
+    with st.form('main_form'):
+        url = st.text_input('URL do video')
+        summary_filename = st.text_input('Nome do Arquivo: ')
+
+        if st.form_submit_button('Criar Sumário') and url and summary_filename:
+            with st.spinner('Aguarde...'):
+                audio_file_name = download_youtube_audio(url,audio_dir)
+                audio_file = f'{audio_dir}/{audio_file_name}.mp3'
+
+                transcription_data = transcribe_audio(audio_file,client)
+                create_summary(transcription_data,client,summary_filename=summary_filename)
+
+
+
+    with st.sidebar:
+
+        st.subheader('Configurações')
+
+        st.divider()
+        if os.listdir('summary_videos'):
+            for i,summary in enumerate(os.listdir('summary_videos')):
+                col1,col2 = st.columns([0.6,0.4])
+
+                with col1:
+                    st.text(summary.replace('.md',''))
+                with col2:
+                    if st.button('Ler arquivo',key=i):
+                        with open(f'summary_videos/{summary}','r',encoding='utf-8') as mark:
+                            st.session_state['markdown_content']['Title'] = summary
+                            st.session_state['markdown_content']['Content'] = mark.read()
+                        st.rerun()
+        else:
+            st.info('Nenhum arquivo encontrado. Crie um!')
+
+    if st.session_state['markdown_content']:
+        st.divider()
+        st.subheader(st.session_state['markdown_content']['Title'].replace('.md',''))
+        st.markdown(st.session_state['markdown_content']['Content'])
+
+main()
